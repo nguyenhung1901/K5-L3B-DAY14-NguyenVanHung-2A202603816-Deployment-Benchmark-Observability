@@ -95,10 +95,215 @@ Từ hai phiên bản, tôi rút ra rằng một Agent chạy được trên má
 
 ---
 
+## Part 2: Docker Containerization
+
+### Exercise 2.1: Đọc Dockerfile cơ bản
+
+Mã nguồn tham khảo: `02-docker/develop/Dockerfile`.
+
+**1. Base image là gì?**  
+Base image là image nền cung cấp môi trường để xây dựng image mới. Dockerfile develop dùng `FROM python:3.11`, tức image Python 3.11 bản đầy đủ. Nó chứa Python runtime cùng các thành phần hệ thống cần thiết, nhưng thường có dung lượng lớn hơn bản `slim`.
+
+**2. Working directory là gì?**  
+`WORKDIR /app` đặt `/app` làm thư mục làm việc mặc định bên trong container. Những lệnh tương đối phía sau như `COPY ... .` và lệnh khởi chạy sẽ được thực thi theo ngữ cảnh thư mục này.
+
+**3. Tại sao copy `requirements.txt` trước khi copy source code?**  
+Docker lưu cache theo từng bước build. Khi copy file requirements trước rồi `RUN pip install`, nếu mã nguồn thay đổi nhưng requirements không đổi thì Docker có thể dùng lại layer cài dependencies, tránh cài lại thư viện không cần thiết. `pip install --no-cache-dir` chỉ tắt cache của pip, không tắt Docker layer cache.
+
+**4. `CMD` và `ENTRYPOINT` khác nhau thế nào?**  
+`CMD` cung cấp lệnh hoặc đối số mặc định của container; có thể thay bằng đối số đặt sau tên image trong `docker run`. `ENTRYPOINT` xác định chương trình chính; các đối số khi chạy thường được nối vào lệnh này. `ENTRYPOINT` vẫn có thể bị thay thế bằng tùy chọn `--entrypoint`. Trong Dockerfile develop, `CMD ["python", "app.py"]` là lệnh chạy Agent mặc định.
+
+### Exercise 2.2: Build và chạy basic container
+
+Thực hiện từ thư mục gốc repository trên Windows PowerShell, sử dụng Docker Desktop với Linux containers:
+
+```powershell
+docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .
+docker images my-agent:develop
+docker run --rm -d --name k5-day14-basic -p 8000:8000 my-agent:develop
+curl.exe -i http://localhost:8000/health
+curl.exe -i -X POST "http://localhost:8000/ask?question=What%20is%20Docker%3F"
+docker logs k5-day14-basic
+docker stop k5-day14-basic
+```
+
+**Kết quả quan sát từ terminal:**
+
+| Thông tin | Kết quả |
+|---|---|
+| Docker build | `FINISHED (12/12)`, 76,6 giây |
+| Image | `my-agent:develop` (ID rút gọn `82af015681e2`) |
+| `docker images` — Content Size | 426 MB |
+| `docker image inspect` — Size | 406,57 MiB |
+| Docker Desktop — Disk Usage | 1,67 GB (chỉ số hiển thị riêng của Docker Desktop) |
+| Container | `k5-day14-basic`, chạy ở `0.0.0.0:8000->8000/tcp` |
+| `GET /health` | HTTP `200 OK` |
+| `POST /ask?question=What%20is%20Docker%3F` | HTTP `200 OK` |
+
+Phản hồi thực tế:
+
+```text
+GET /health -> HTTP/1.1 200 OK
+{"status":"ok","uptime_seconds":9.2,"container":true}
+
+POST /ask?question=What%20is%20Docker%3F -> HTTP/1.1 200 OK
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+```
+
+`docker logs` ghi nhận Uvicorn lắng nghe trên `0.0.0.0:8000`, cả hai request đều trả `200 OK`. Endpoint develop nhận `question` qua **query parameter** theo mã nguồn; không dùng JSON body như ví dụ chưa được cập nhật trong `CODE_LAB.md`. Container đã được dừng bằng `docker stop` sau khi kiểm thử.
+
+### Exercise 2.3: Multi-stage build và so sánh image
+
+Mã nguồn tham khảo: `02-docker/production/Dockerfile`.
+
+**Stage 1 — `builder`:** Dùng `python:3.11-slim`, cài công cụ build như `gcc`, `libpq-dev`, sau đó cài Python dependencies vào `/root/.local` bằng `pip install --user`.
+
+**Stage 2 — `runtime`:** Bắt đầu từ image `python:3.11-slim` sạch, copy phần dependencies đã cài từ builder và copy mã nguồn Agent. Tạo người dùng `appuser`, chuyển sang chạy bằng `USER appuser`, cấu hình `PATH`, `PYTHONPATH`, health check và lệnh Uvicorn. Công cụ build của stage đầu không nằm trong image runtime cuối cùng.
+
+Lệnh đã thực hiện:
+
+```powershell
+docker build -f 02-docker/production/Dockerfile -t my-agent:advanced .
+docker images my-agent
+
+$devBytes = [double](docker image inspect my-agent:develop --format '{{.Size}}')
+$prodBytes = [double](docker image inspect my-agent:advanced --format '{{.Size}}')
+"Develop: {0:N2} MiB" -f ($devBytes / 1MB)
+"Production: {0:N2} MiB" -f ($prodBytes / 1MB)
+"Reduction: {0:N2}%" -f ((1 - $prodBytes / $devBytes) * 100)
+```
+
+**Kết quả đo thực tế:**
+
+| Chỉ số | Develop (single-stage) | Production (multi-stage) |
+|---|---:|---:|
+| Base image | `python:3.11` | `python:3.11-slim` (builder và runtime) |
+| Build time | 76,6 giây | 74,1 giây |
+| Docker CLI — Content Size | 426 MB | 57,4 MB |
+| `docker image inspect` — Size | **406,57 MiB** | **54,75 MiB** |
+| Docker Desktop — Disk Usage | 1,67 GB | 240 MB |
+| Health check | HTTP 200 | HTTP 200 |
+| Agent endpoint | HTTP 200 | HTTP 200 |
+
+Tính tỷ lệ giảm từ **cùng chỉ số `docker image inspect .Size`**, không trộn với Disk Usage:
+
+```text
+Reduction = (406.57 - 54.75) / 406.57 * 100 = 86.53%
+```
+
+Image production nhỏ hơn khoảng **351,82 MiB (86,53%)** so với develop. Kết quả đến từ việc sử dụng base image `slim` và tách dependencies/build tools khỏi runtime bằng multi-stage. Hai thời gian build trên không đủ để kết luận multi-stage luôn build nhanh hơn, vì còn phụ thuộc cache và mạng.
+
+**Kiểm thử production container:**
+
+```powershell
+docker run --rm -d --name k5-day14-advanced -p 8000:8000 -e ENVIRONMENT=production my-agent:advanced
+curl.exe -i http://localhost:8000/health
+'{"question":"What is Docker?"}' | Set-Content -Encoding ascii request.json
+curl.exe -i -X POST http://localhost:8000/ask -H "Content-Type: application/json" --data-binary "@request.json"
+Remove-Item request.json
+docker stop k5-day14-advanced
+```
+
+Kết quả `GET /health`: HTTP `200 OK`, trả `status=ok`, `version=2.0.0`, `uptime_seconds=10.8`. Kết quả `POST /ask` với JSON hợp lệ: HTTP `200 OK`, trả lời đúng phản hồi mock về Docker giống phần develop.
+
+Trong hai lần thử đầu, cách escape JSON trực tiếp với `curl.exe` trong PowerShell làm request bị sai và nhận HTTP 500, kèm lỗi phân tích đối số của curl. Khi chuyển sang gửi dữ liệu bằng file `request.json`, API trả 200. Đây là lỗi truyền request trong quá trình thử, không phải bằng chứng production Agent hoạt động đúng với JSON lỗi. Container đã được dừng sau khi kiểm thử.
+
+### Exercise 2.4: Docker Compose stack
+
+Đọc `02-docker/production/docker-compose.yml` và `02-docker/production/nginx/nginx.conf`. Stack dùng bốn service trong cùng Docker bridge network `internal`.
+
+**Sơ đồ kiến trúc (logical deployment):**
+
+```text
+                   Client (localhost)
+                          |
+                   HTTP port 80
+                          |
+                     +---------+
+                     |  Nginx  |
+                     +---------+
+                          |
+                 proxy_pass agent:8000
+                          |
+                     +---------+
+                     |  Agent  |  FastAPI / Uvicorn
+                     +---------+
+                      /       \
+          REDIS_URL  /         \  QDRANT_URL
+                    v           v
+             +-----------+  +-----------+
+             |   Redis   |  |  Qdrant   |
+             |   :6379   |  |   :6333   |
+             +-----------+  +-----------+
+              redis_data     qdrant_data
+                 (named Docker volumes)
+```
+
+**Vai trò và đường kết nối:**
+
+| Service | Vai trò / kết nối |
+|---|---|
+| `nginx` | Reverse proxy, nhận request từ host cổng 80 và chuyển đến upstream `agent:8000`. File cấu hình còn khai báo rate limiting theo IP. |
+| `agent` | FastAPI chạy tại cổng nội bộ 8000; chỉ truy cập từ host qua Nginx, không public trực tiếp cổng 8000 của Compose stack. |
+| `redis` | Dịch vụ cache/session, lắng nghe nội bộ ở `redis:6379`, gắn volume `redis_data`. |
+| `qdrant` | Vector database phục vụ RAG, lắng nghe nội bộ ở `qdrant:6333`, gắn volume `qdrant_data`. |
+
+Docker Compose đặt `REDIS_URL=redis://redis:6379/0` và `QDRANT_URL=http://qdrant:6333` cho Agent, đồng thời dùng `depends_on` với điều kiện `service_healthy`. **Trong ví dụ này, `main.py` chỉ trả lời bằng mock LLM và chưa thực hiện truy vấn Redis/Qdrant**; sơ đồ thể hiện khả năng kết nối theo cấu hình, không phải bằng chứng về luồng dữ liệu RAG thực tế. Nginx cũng publish cổng 443 nhưng chưa có cấu hình chứng chỉ TLS trong file Nginx được cung cấp, nên không kết luận HTTPS đã sẵn sàng.
+
+**Lệnh đã chạy trên PowerShell từ gốc repository:**
+
+```powershell
+# Tạo file env rỗng theo hướng dẫn K5 (được .gitignore bỏ qua)
+New-Item -ItemType File -Path "02-docker/production/.env.local"
+
+docker compose -p k5-day14-docker -f 02-docker/production/docker-compose.yml config --services
+docker compose -p k5-day14-docker -f 02-docker/production/docker-compose.yml up -d --build
+docker compose -p k5-day14-docker -f 02-docker/production/docker-compose.yml ps
+curl.exe -i http://localhost/health
+'{"question":"Explain microservices"}' | Set-Content -Encoding ascii request.json
+curl.exe -i -X POST http://localhost/ask -H "Content-Type: application/json" --data-binary "@request.json"
+Remove-Item request.json
+```
+
+**Kết quả quan sát:**
+
+| Kiểm tra | Kết quả |
+|---|---|
+| `config --services` | Liệt kê đủ `qdrant`, `redis`, `agent`, `nginx` |
+| Docker build stack | `FINISHED (20/20)` khi build lại, dùng cache |
+| Containers | Bốn service được tạo và chạy (`Up`) |
+| Redis | `Up ... (healthy)` |
+| Qdrant | `Up ... (healthy)` |
+| Agent | `Up ... (health: starting)` lúc gọi `ps`, chưa có log `healthy` sau đó trong bằng chứng đã gửi |
+| Nginx | `Up`, publish cổng 80 và 443 |
+| `GET http://localhost/health` | HTTP `200 OK`, `Server: nginx` |
+| `POST http://localhost/ask` | HTTP `200 OK`, `Server: nginx` |
+
+Output API đã quan sát:
+
+```text
+GET http://localhost/health -> HTTP/1.1 200 OK
+{"status":"ok","uptime_seconds":7.1,"version":"2.0.0","timestamp":"2026-11-26T08:39:38.383835"}
+
+POST http://localhost/ask -> HTTP/1.1 200 OK
+{"answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."}
+```
+
+Lần đầu chạy Compose bị Docker Hub trả **HTTP 429 Too Many Requests** khi resolve `nginx:alpine`, sau đó `qdrant/qdrant:v1.9.0`. Tôi đăng nhập Docker Hub và tải lần lượt `nginx:alpine`, `redis:7-alpine`, `qdrant/qdrant:v1.9.0`; sau đó `docker compose up -d --build` chạy thành công. Compose còn cảnh báo `version` obsolete vì file có `version: "3.9"`, nhưng cảnh báo này không ảnh hưởng việc khởi chạy.
+
+**Đánh giá:** Stack Docker Compose đã khởi chạy đủ bốn service và định tuyến request qua Nginx đến Agent thành công. Ở thời điểm `docker compose ps`, Agent vẫn đang trong giai đoạn health check khởi tạo, tuy nhiên `/health` sau đó đã phản hồi 200; chưa có bằng chứng kiểm tra trạng thái `healthy` ổn định sau khi chờ. Kết quả hiện tại đáp ứng mục tiêu kiểm thử API qua Nginx của Exercise 2.4.
+
+### Tổng kết Part 2
+
+Tôi đã thực hành build image single-stage và multi-stage, khởi chạy container, dùng `docker logs` để kiểm tra request, đo kích thước image và chạy stack nhiều dịch vụ bằng Docker Compose. Image production giảm 86,53% theo kết quả đo thực tế; stack `agent + redis + qdrant + nginx` phản hồi thành công qua reverse proxy. Việc ứng dụng mock trả HTTP 200 chưa đồng nghĩa với việc các chức năng cache, RAG, TLS hay vận hành production đầy đủ đã được kiểm thử.
+
+---
+
 ## AI log
 
 | Phần | Mục đích sử dụng AI | Nội dung hỗ trợ | Cách tự kiểm tra |
 |---|---|---|---|
 | Part 1 — Exercise 1.1–1.3 | Nhờ ChatGPT hướng dẫn đọc phát hiện anti-pattern và trình bày phần so sánh develop/production | Gợi ý giải thích lý do các cấu hình chưa phù hợp production và hỗ trợ sửa `MISSION_ANSWERS.md` | Đọc `develop/app.py`, `production/app.py`, `config.py`; tự chạy hai phiên bản trên Ubuntu WSL2; gửi các request đến `/ask`, `/health`, `/ready` và kiểm tra HTTP status/log thực tế. |
+| Part 2 — Exercise 2.1–2.4 | Nhờ ChatGPT giải thích Dockerfile, multi-stage build, lỗi Docker Hub 429, lỗi cú pháp JSON trong PowerShell và hỗ trợ viết báo cáo | Hướng dẫn lệnh build/run, so sánh kích thước, đọc Docker Compose, diễn giải kiến trúc và tổng hợp số liệu | Tự build hai image, chạy và kiểm thử container; dùng `docker image inspect` tính mức giảm 86,53%; tự đăng nhập Docker Hub, pull image, chạy bốn service và kiểm tra API qua Nginx. Đối chiếu log đầu ra trước khi đưa số liệu vào báo cáo. |
 
-> Các mục Part 2–5, kết quả Part 6 và AI log tương ứng sẽ được bổ sung sau khi hoàn thành từng checkpoint.
+> Các mục Part 3–5, kết quả Part 6 và AI log tương ứng sẽ được bổ sung sau khi hoàn thành từng checkpoint.
