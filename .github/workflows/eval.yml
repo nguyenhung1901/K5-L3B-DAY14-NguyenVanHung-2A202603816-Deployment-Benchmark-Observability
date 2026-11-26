@@ -1,0 +1,52 @@
+name: quality-gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: 06-lab-complete/benchmark-observability/develop
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run Agent v2 and evaluation (minimum 85%)
+        shell: bash
+        run: |
+          set -euo pipefail
+          AGENT_VERSION=v2 MOCK_ERROR_RATE=0 MOCK_SLOW_RATE=0 PORT=8000 \
+            python app.py > agent_ci.log 2>&1 &
+          AGENT_PID=$!
+          trap 'kill "$AGENT_PID" 2>/dev/null || true' EXIT
+
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8000/health > /dev/null; then
+              break
+            fi
+            if ! kill -0 "$AGENT_PID" 2>/dev/null; then
+              cat agent_ci.log
+              exit 1
+            fi
+            sleep 1
+          done
+
+          curl --fail --silent http://127.0.0.1:8000/health > /dev/null || {
+            cat agent_ci.log
+            exit 1
+          }
+          python eval/run_eval.py \
+            --url http://127.0.0.1:8000 \
+            --min-accuracy 0.85 \
+            --out reports/eval_ci.json
