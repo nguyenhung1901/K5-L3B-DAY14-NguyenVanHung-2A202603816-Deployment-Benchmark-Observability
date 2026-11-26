@@ -470,6 +470,222 @@ def check_budget(user_id: str, estimated_cost: float) -> bool:
 
 ---
 
+## Part 5: Scaling & Reliability
+
+**Môi trường thực hành:** Ubuntu WSL2, Python 3.12 trong virtual environment `day14`; Docker Desktop chạy Linux containers. Phần develop kiểm thử tại `localhost:8000`, phần production triển khai qua Nginx tại `localhost:8080` ngày 26/11/2026. Agent sử dụng mock LLM, không gọi mô hình bên ngoài.
+
+### Exercise 5.1: Health Check và Readiness Check
+
+**Mã nguồn:** `05-scaling-reliability/develop/app.py`. Ứng dụng dùng `lifespan()` để đánh dấu thời điểm sẵn sàng, middleware `track_requests` để theo dõi số request đang xử lý và hai endpoint `/health`, `/ready`.
+
+- **Liveness (`/health`):** xác nhận tiến trình vẫn phản hồi và cung cấp các thông tin như uptime, phiên bản, môi trường và tình trạng bộ nhớ. Nền tảng vận hành có thể dùng để phát hiện tiến trình không còn hoạt động.
+- **Readiness (`/ready`):** kiểm tra cờ `_is_ready`; trả HTTP 200 nếu Agent sẵn sàng nhận request hoặc HTTP 503 khi chưa sẵn sàng. Load balancer có thể dựa trên readiness để tránh gửi traffic tới instance chưa sẵn sàng.
+
+**Lệnh đã thực hiện:**
+
+```bash
+cd 05-scaling-reliability/develop
+python app.py
+
+# Từ terminal Ubuntu thứ hai
+curl -i http://localhost:8000/health
+curl -i http://localhost:8000/ready
+curl -i -X POST 'http://localhost:8000/ask?question=hello'
+```
+
+**Kết quả thực tế:**
+
+```text
+GET /health -> HTTP/1.1 200 OK
+{"status":"ok","uptime_seconds":13.5,"version":"1.0.0","environment":"development","timestamp":"2026-11-26T09:22:23.491959+00:00","checks":{"memory":{"status":"ok","used_percent":23.9}}}
+
+GET /ready -> HTTP/1.1 200 OK
+{"ready":true,"in_flight_requests":1}
+
+POST /ask?question=hello -> HTTP/1.1 200 OK
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
+
+Kết quả xác nhận các endpoint đều hoạt động. `in_flight_requests=1` tại thời điểm gọi `/ready` có thể bao gồm chính request kiểm tra này; không có bằng chứng về một request bị treo. Bài chưa thử trường hợp `/ready` trả 503 khi đang khởi động hoặc dừng.
+
+### Exercise 5.2: Graceful Shutdown bằng SIGTERM
+
+**Mục tiêu:** quan sát hai request đang xử lý có hoàn thành trước khi server dừng hay không. Mã nguồn sử dụng Uvicorn với `timeout_graceful_shutdown=30`, kết hợp `lifespan()` và biến đếm `_in_flight_requests` để theo dõi quá trình dừng ứng dụng.
+
+**Thao tác thực tế:** xác định server có PID `8966` bằng `ps`, sau đó gửi hai request nền và gửi `SIGTERM` sau 0,5 giây.
+
+```bash
+ps -eo pid,args | grep '[p]ython app.py'
+SERVER_PID=8966
+ps -p "$SERVER_PID" -o pid,args
+
+curl -sS -o /tmp/day14-req1.json \
+  -w 'Request 1: HTTP %{http_code}\n' \
+  -X POST 'http://localhost:8000/ask?question=hello' &
+P1=$!
+
+curl -sS -o /tmp/day14-req2.json \
+  -w 'Request 2: HTTP %{http_code}\n' \
+  -X POST 'http://localhost:8000/ask?question=hello' &
+P2=$!
+
+sleep 0.5
+kill -SIGTERM "$SERVER_PID"
+wait "$P1"
+wait "$P2"
+```
+
+**Kết quả terminal gửi request:**
+
+```text
+Request 2: HTTP 200
+Request 1: HTTP 200
+```
+
+Hai file `/tmp/day14-req1.json` và `/tmp/day14-req2.json` đều chứa câu trả lời mock hợp lệ.
+
+**Log server ghi nhận:**
+
+```text
+INFO:     Shutting down
+INFO:     127.0.0.1:52442 - "POST /ask?question=hello HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52440 - "POST /ask?question=hello HTTP/1.1" 200 OK
+INFO:     Waiting for application shutdown.
+2026-11-26 09:30:02,202 INFO Graceful shutdown initiated...
+2026-11-26 09:30:02,203 INFO Shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [8966]
+2026-11-26 09:30:02,204 INFO Received signal 15 - uvicorn will handle graceful shutdown
+```
+
+**Đánh giá:** trong lần kiểm thử này, hai request đều trả 200 trước khi tiến trình kết thúc, phù hợp mục tiêu graceful shutdown. Log không có số liệu đủ để kết luận chúng được xử lý song song hoàn toàn; bản mock cũng có đoạn `time.sleep()` nên có thể chặn event loop. Chưa kiểm thử mọi tình huống mất kết nối, timeout hoặc nhận request mới trong giai đoạn shutdown.
+
+### Exercise 5.3: Stateless Agent và Redis Session
+
+**Mã nguồn:** `05-scaling-reliability/production/app.py`. Thay vì lưu toàn bộ hội thoại trong bộ nhớ riêng của mỗi Agent, ứng dụng tạo session theo `session_id`, lưu JSON vào Redis và truy xuất qua khóa `session:<session_id>`.
+
+| Thành phần | Chức năng |
+|---|---|
+| `save_session()` | Dùng Redis `SETEX` lưu dữ liệu session với TTL mặc định 3.600 giây. |
+| `load_session()` | Dùng Redis `GET`, giải mã JSON để đọc lại session. |
+| `append_to_history()` | Thêm lượt `user` hoặc `assistant`; chỉ giữ tối đa 20 messages. |
+| `POST /chat` | Nhận `question` và `session_id`; trả `served_by` và `storage`. |
+| `GET /chat/{session_id}/history` | Trả toàn bộ lịch sử hội thoại của session hiện có. |
+
+**Vì sao không nên giữ state trong RAM khi scale?** Mỗi container có vùng nhớ riêng. Nếu lượt hỏi đầu tiên đến Agent 1, còn lượt thứ hai đến Agent 2, Agent 2 sẽ không đọc được lịch sử lưu trong RAM của Agent 1. Redis cung cấp vùng lưu trữ chung để các instance tiếp tục cùng một session.
+
+**Kiểm chứng thực tế:** bản production trả `"storage":"redis"`, `"redis_connected":true`; `test_stateless.py` nhận lịch sử 10 messages của cùng một session dù request đi tới ba instance khác nhau (chi tiết ở Exercise 5.5). Truy vấn Redis trực tiếp cũng tìm được khóa session đã tạo.
+
+**Giới hạn:** mã mẫu có cơ chế fallback sang `_memory_store` nếu không kết nối được Redis lúc khởi tạo. Vì vậy, chương trình không bảo đảm stateless trong mọi tình huống; kết quả này chỉ xác nhận **lần chạy đã sử dụng Redis**. Redis Compose mẫu cũng chưa khai báo named volume, nên không khẳng định session còn sau khi container Redis bị xóa và tạo lại.
+
+### Exercise 5.4: Nginx Load Balancing với 3 Agent
+
+**Mã nguồn:** `05-scaling-reliability/production/docker-compose.yml`, `nginx.conf`. Nginx nhận traffic từ cổng host `8080` và chuyển tới upstream `agent:8000` qua Docker network; ba Agent cùng sử dụng dịch vụ Redis nội bộ.
+
+**Sơ đồ triển khai:**
+
+```text
+                     Client
+                        |
+                localhost:8080
+                        |
+                 +-------------+
+                 | Nginx       |
+                 | port 80     |
+                 +-------------+
+                     /  |  \
+                    v   v   v
+                +----+ +----+ +----+
+                | A1 | | A2 | | A3 |    Agent :8000
+                +----+ +----+ +----+
+                    \   |   /
+                     v   v  v
+                 +-------------+
+                 | Redis :6379 |
+                 | Shared state|
+                 +-------------+
+```
+
+**Lệnh thực hiện trong `05-scaling-reliability/production/`:**
+
+```bash
+touch .env.local
+docker compose -p k5-day14-scaling up -d --build --scale agent=3
+docker compose -p k5-day14-scaling ps
+curl -i http://localhost:8080/health
+curl -i http://localhost:8080/ready
+```
+
+**Kết quả thực tế từ `docker compose ps`:**
+
+| Service | Trạng thái quan sát |
+|---|---|
+| `agent-1` | `Up` (health: starting tại thời điểm kiểm tra) |
+| `agent-2` | `Up` (health: starting tại thời điểm kiểm tra) |
+| `agent-3` | `Up` (health: starting tại thời điểm kiểm tra) |
+| `nginx` | `Up`; host `8080` -> container `80` |
+| `redis` | `Up ... (healthy)` |
+
+Hai request qua Nginx đều thành công và được phục vụ từ hai địa chỉ upstream khác nhau:
+
+```text
+GET /health -> HTTP/1.1 200 OK
+Server: nginx/1.31.10
+X-Served-By: 172.19.0.3:8000
+{"status":"ok","instance_id":"instance-425c2d","uptime_seconds":7.9,"storage":"redis","redis_connected":true}
+
+GET /ready -> HTTP/1.1 200 OK
+Server: nginx/1.31.10
+X-Served-By: 172.19.0.4:8000
+{"ready":true,"instance":"instance-18271a"}
+```
+
+Kết quả cho thấy Nginx đã proxy request và có phân phối sang các instance khác nhau. Trạng thái health `starting` ở lần gọi `ps` chỉ phản ánh thời điểm mới khởi động; chưa có ảnh/log `ps` sau đó xác nhận tất cả Agent đạt trạng thái `healthy`.
+
+### Exercise 5.5: Kiểm thử session dùng chung giữa các instance
+
+Chạy trong thư mục `production/`:
+
+```bash
+python test_stateless.py
+docker compose -p k5-day14-scaling exec redis redis-cli --scan --pattern 'session:*'
+docker compose -p k5-day14-scaling down
+```
+
+**Kết quả thực tế từ script:**
+
+```text
+Session ID: ba1e979a-ca97-4403-b50a-b21c503f7e33
+
+Request 1: [instance-4a0954]  What is Docker?
+Request 2: [instance-425c2d]  Why do we need containers?
+Request 3: [instance-18271a]  What is Kubernetes?
+Request 4: [instance-4a0954]  How does load balancing work?
+Request 5: [instance-425c2d]  What is Redis used for?
+
+Total requests: 5
+Instances used: {'instance-4a0954', 'instance-425c2d', 'instance-18271a'}
+All requests served despite different instances!
+Total messages: 10
+Session history preserved across all instances via Redis!
+```
+
+Năm lượt hỏi và năm lượt trả lời đều có trong history, dù các request được xử lý bởi **ba instance khác nhau**. Truy vấn Redis trực tiếp trả về:
+
+```text
+"session:ba1e979a-ca97-4403-b50a-b21c503f7e33"
+```
+
+Sau đó `docker compose -p k5-day14-scaling down` đã gỡ ba Agent, Nginx, Redis và network liên quan.
+
+**Phạm vi kiểm thử:** file `test_stateless.py` thực tế chỉ gửi năm câu hỏi và đọc lại history; **không kill một Agent ngẫu nhiên** như mô tả trong `CODE_LAB.md`. Vì thế kết quả hiện có xác nhận load balancing và shared session, chưa phải kiểm thử failover khi một Agent mất kết nối. Bản mock trả lời theo câu hỏi hiện tại; việc giữ history cũng chưa chứng minh Agent sử dụng toàn bộ ngữ cảnh để sinh câu trả lời.
+
+### Tổng kết Part 5
+
+Đã chạy thành công health/readiness check, gửi SIGTERM và quan sát hai request hoàn thành trước khi tắt, khởi động 3 Agent qua Nginx cùng Redis, và xác minh 5 lượt hội thoại tạo đủ 10 messages trong một session được xử lý xuyên ba instance. Những điểm chưa kiểm chứng gồm: trạng thái `healthy` cuối của cả ba Agent, khả năng failover sau khi cố ý dừng một instance, và khả năng giữ session khi Redis bị xóa/khởi động lại. Các kết quả ghi trong Part 5 đều dựa trên log chạy thật, không phải số liệu minh họa trong README.
+
+---
+
 ## AI log
 
 | Phần | Mục đích sử dụng AI | Nội dung hỗ trợ | Cách tự kiểm tra |
@@ -477,5 +693,6 @@ def check_budget(user_id: str, estimated_cost: float) -> bool:
 | Part 1 — Exercise 1.1–1.3 | Nhờ ChatGPT hướng dẫn đọc phát hiện anti-pattern và trình bày phần so sánh develop/production | Gợi ý giải thích lý do các cấu hình chưa phù hợp production và hỗ trợ sửa `MISSION_ANSWERS.md` | Đọc `develop/app.py`, `production/app.py`, `config.py`; tự chạy hai phiên bản trên Ubuntu WSL2; gửi các request đến `/ask`, `/health`, `/ready` và kiểm tra HTTP status/log thực tế. |
 | Part 2 — Exercise 2.1–2.4 | Nhờ ChatGPT giải thích Dockerfile, multi-stage build, lỗi Docker Hub 429, lỗi cú pháp JSON trong PowerShell và hỗ trợ viết báo cáo | Hướng dẫn lệnh build/run, so sánh kích thước, đọc Docker Compose, diễn giải kiến trúc và tổng hợp số liệu | Tự build hai image, chạy và kiểm thử container; dùng `docker image inspect` tính mức giảm 86,53%; tự đăng nhập Docker Hub, pull image, chạy bốn service và kiểm tra API qua Nginx. Đối chiếu log đầu ra trước khi đưa số liệu vào báo cáo. |
 | Part 4 — Exercise 4.1–4.4 | Nhờ ChatGPT hướng dẫn kiểm thử API key/JWT, rate limiting, đề xuất thiết kế cost guard | Giải thích 401/403/200/429, thống kê usage, phân biệt ngân sách mẫu in-memory với bài toán Redis $10/tháng, phát hiện trường phản hồi `/ask` đặt sai tên | Tự chạy các curl, vòng lặp 20 request và kiểm tra response `curl -i` HTTP 429 trên WSL2; xem HTTP status, headers và `/me/usage`; đối chiếu `app.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`; chưa tuyên bố đã test HTTP 402 hoặc chạy Redis budget. |
+| Part 5 — Exercise 5.1–5.5 | Nhờ ChatGPT hướng dẫn kiểm thử health/readiness, graceful shutdown và thiết kế stateless/load balancing | Hỗ trợ đối chiếu checkpoint, giải thích Redis session, Nginx và tổng hợp báo cáo Part 5 | Tự gọi `/health`, `/ready`, `/ask`; gửi SIGTERM đến PID 8966, ghi nhận hai HTTP 200 và log shutdown; tự chạy Docker Compose với 3 Agent, `test_stateless.py`, kiểm tra khóa session trong Redis và dừng stack; chỉ ghi những kết quả đã quan sát. |
 
-> Các mục Part 3, Part 5, kết quả Part 6 và AI log tương ứng sẽ được bổ sung sau khi hoàn thành từng checkpoint.
+> Các mục Part 3, kết quả Part 6 và Part 7 cùng AI log tương ứng sẽ được bổ sung sau khi hoàn thành từng checkpoint.
