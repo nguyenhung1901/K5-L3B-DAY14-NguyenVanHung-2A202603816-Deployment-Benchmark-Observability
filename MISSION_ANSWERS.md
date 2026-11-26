@@ -300,6 +300,68 @@ Tôi đã thực hành build image single-stage và multi-stage, khởi chạy c
 ---
 
 
+## Part 3: Cloud Deployment (CP6)
+
+**Ngày thực hiện:** 26/11/2026. Theo lộ trình K5, tôi triển khai chính Agent đã hoàn thiện ở `06-lab-complete/`, không triển khai lại bản demo trong `03-cloud-deployment/`. Agent sử dụng mock LLM và Redis trên cloud.
+
+### Exercise 3.1 — Triển khai Railway
+
+**Nền tảng:** Railway, project `gracious-insight`, environment `production`.
+
+- **Public URL:** https://k5-l3b-day14-nguyenvanhung-2a202603816-deploymen-production.up.railway.app
+- **GitHub repo:** https://github.com/nguyenhung1901/K5-L3B-DAY14-NguyenVanHung-2A202603816-Deployment-Benchmark-Observability (branch `main`)
+- **Root Directory:** `/06-lab-complete`, Dockerfile ở `/06-lab-complete/Dockerfile`.
+- **Các service:** FastAPI/Uvicorn Agent và Redis (cùng Railway project, kết nối nội bộ qua biến `REDIS_URL`).
+- **Cấu hình:** `AGENT_API_KEY` là secret trong Railway Variables; `REDIS_URL` dùng variable reference đến service Redis; có `ENVIRONMENT=production`, giới hạn request và ngân sách minh họa. Healthcheck Path là `/health`.
+- **Trạng thái quan sát trên Dashboard:** Agent và Redis `Online`; Agent deployment `ACTIVE`, `Deployment successful`.
+
+**Kết quả kiểm thử public URL (Ubuntu WSL2, không hiển thị API key):**
+
+```text
+Health: 200
+Ready: 200
+No API Key: 401
+Valid API Key: 200
+```
+
+Hai response đã ghi nhận trực tiếp:
+
+```text
+GET /health -> HTTP/2 200
+{"status":"ok","uptime_seconds":1058.44,"environment":"production"}
+GET /ready -> HTTP/2 200
+{"ready":true}
+```
+
+**Sự cố và cách xử lý:** Ban đầu URL thiếu `https://` làm request bị redirect `301`. Sau khi sửa URL, endpoint vẫn trả `502 Application failed to respond`. Tôi đối chiếu Deploy Logs, xác nhận Uvicorn chạy trên `0.0.0.0:8080`, rồi sửa Target Port trong Railway Public Networking sang `8080` (thay vì cổng `8000` local). Sau đó cả bốn bài kiểm thử public đều đạt. Sự cố nằm ở cấu hình định tuyến port, không có bằng chứng lỗi trong code xử lý `/health`.
+
+**Ảnh và tài liệu:** [dashboard](screenshots/dashboard.png) · [running](screenshots/running.png) · [test](screenshots/test.png) · [DEPLOYMENT.md](DEPLOYMENT.md).
+
+### Exercise 3.2 — So sánh Railway và Render
+
+Tôi chọn **Railway** làm nền tảng triển khai chính. Không triển khai thêm trên Render; phần sau đối chiếu hai file mẫu trong bài lab và file cấu hình thực tế Part 6:
+
+| Nội dung | Railway (`06-lab-complete/railway.toml`) | Render (`03-cloud-deployment/render/render.yaml` — mẫu) |
+|---|---|---|
+| Cách mô tả cấu hình | TOML chia `[build]` và `[deploy]` | YAML `services:` mô tả nhiều dịch vụ trong một Blueprint |
+| Build | Dùng `builder = "DOCKERFILE"` và `dockerfilePath = "Dockerfile"` | Mẫu dùng `runtime: python`, `buildCommand: pip install -r requirements.txt` |
+| Start | Dùng `CMD` trong Dockerfile Part 6 (Uvicorn nhận biến `PORT`) | Mẫu khai báo `startCommand` trực tiếp trong `render.yaml` |
+| Health check | `healthcheckPath = "/health"` | `healthCheckPath: /health` |
+| Redis | Tạo service Redis và tham chiếu `REDIS_URL` từ Agent trong Dashboard | Mẫu có service Redis `type: redis`; khi dùng với Part 6 cần bảo đảm cấu hình kết nối và đường dẫn build phù hợp |
+| Secret | Cấu hình qua Railway Variables/variable references | Mẫu có `envVars`, `sync: false` hoặc `generateValue: true` |
+
+**Nhận xét:** Railway phù hợp để tạo nhanh service và database từ giao diện; Render Blueprint thuận tiện khi cần mô tả nhiều thành phần bằng một file YAML. Mẫu `render.yaml` của Part 3 dùng `app:app` và cấu trúc demo, **không thể coi là đã deploy được Agent Part 6 nếu chưa điều chỉnh**. Trong lần triển khai này, Railway hiển thị cảnh báo Config as Code bị deprecate nên tôi thiết lập Dockerfile và health check trực tiếp trong Dashboard, còn giữ `railway.toml` trong repository để phục vụ kiểm tra mã nguồn.
+
+### Exercise 3.3 — Phân tích pipeline Google Cloud Run
+
+Theo `03-cloud-deployment/production-cloud-run/cloudbuild.yaml`, pipeline chạy **pytest** trước, sau đó **build Docker image** gắn tag commit SHA và `latest`, **push image lên Container Registry**, rồi **deploy image lên Cloud Run** ở region `asia-southeast1`. File `service.yaml` khai báo cổng container `8000`, CPU/RAM, concurrency `80`, auto-scaling từ 1 đến 10 instance, health check `/health` và startup probe `/ready`. Các secret được tham chiếu từ Secret Manager thay vì ghi vào source. Tôi chỉ đọc và phân tích pipeline mẫu, **không thực hiện deploy GCP**.
+
+### Tổng kết Part 3
+
+Agent Part 6 đã được triển khai thành công lên Railway với Redis, public URL hoạt động và bốn bài kiểm thử HTTP đạt `200 / 200 / 401 / 200`. Phần Render và Cloud Run là so sánh/phân tích cấu hình, không phải bằng chứng đã triển khai lên hai nền tảng đó.
+
+---
+
 ## Part 4: API Security
 
 **Môi trường:** Ubuntu WSL2, Python 3.12 trong venv `day14`. Đây là các ứng dụng minh họa dùng mock LLM; các phép thử được chạy trên `localhost:8000` ngày 26/11/2026. Các key và tài khoản được dùng là dữ liệu demo của bài lab.
@@ -769,7 +831,7 @@ POST /ask (gửi X-API-Key hợp lệ, JSON {"question":"Hello Part 6"})
 
 ### Tổng kết Part 6
 
-Agent Part 6 đạt **PASS 12/12, 41/41 checks passed** trên môi trường local có Docker và Redis. Các kiểm thử chính về xác thực, giới hạn tần suất, ngân sách, readiness, logging và shutdown đã chạy thành công. Bước còn lại của nhóm Deployment là tạo URL public và minh chứng trên Railway/Render trong CP6.
+Agent Part 6 đạt **PASS 12/12, 41/41 checks passed** trên môi trường local có Docker và Redis. Các kiểm thử chính về xác thực, giới hạn tần suất, ngân sách, readiness, logging và shutdown đã chạy thành công. Phần Deployment trên Railway đã được xác minh ở CP6/Part 3: public URL hoạt động với 4 kết quả HTTP `200 / 200 / 401 / 200` và có ảnh trong `screenshots/`.
 
 ---
 
@@ -781,6 +843,7 @@ Agent Part 6 đạt **PASS 12/12, 41/41 checks passed** trên môi trường loc
 | Part 2 — Exercise 2.1–2.4 | Nhờ ChatGPT giải thích Dockerfile, multi-stage build, lỗi Docker Hub 429, lỗi cú pháp JSON trong PowerShell và hỗ trợ viết báo cáo | Hướng dẫn lệnh build/run, so sánh kích thước, đọc Docker Compose, diễn giải kiến trúc và tổng hợp số liệu | Tự build hai image, chạy và kiểm thử container; dùng `docker image inspect` tính mức giảm 86,53%; tự đăng nhập Docker Hub, pull image, chạy bốn service và kiểm tra API qua Nginx. Đối chiếu log đầu ra trước khi đưa số liệu vào báo cáo. |
 | Part 4 — Exercise 4.1–4.4 | Nhờ ChatGPT hướng dẫn kiểm thử API key/JWT, rate limiting, đề xuất thiết kế cost guard | Giải thích 401/403/200/429, thống kê usage, phân biệt ngân sách mẫu in-memory với bài toán Redis $10/tháng, phát hiện trường phản hồi `/ask` đặt sai tên | Tự chạy các curl, vòng lặp 20 request và kiểm tra response `curl -i` HTTP 429 trên WSL2; xem HTTP status, headers và `/me/usage`; đối chiếu `app.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`; chưa tuyên bố đã test HTTP 402 hoặc chạy Redis budget. |
 | Part 5 — Exercise 5.1–5.5 | Nhờ ChatGPT hướng dẫn kiểm thử health/readiness, graceful shutdown và thiết kế stateless/load balancing | Hỗ trợ đối chiếu checkpoint, giải thích Redis session, Nginx và tổng hợp báo cáo Part 5 | Tự gọi `/health`, `/ready`, `/ask`; gửi SIGTERM đến PID 8966, ghi nhận hai HTTP 200 và log shutdown; tự chạy Docker Compose với 3 Agent, `test_stateless.py`, kiểm tra khóa session trong Redis và dừng stack; chỉ ghi những kết quả đã quan sát. |
+| Part 3 / CP6 — Cloud Deployment | Nhờ ChatGPT hướng dẫn cấu hình Railway, kết nối Redis, phân tích lỗi HTTP 301/502 và viết báo cáo triển khai | Giải thích root directory, Dockerfile, biến môi trường, public target port và so sánh Railway/Render/Cloud Run | Tự deploy Agent + Redis trên Railway, đọc Deploy Logs xác nhận Uvicorn nghe `8080`, sửa Public Domain Target Port từ cấu hình sai sang `8080`, tự chạy curl từ WSL2 và xác nhận `200 / 200 / 401 / 200`; chụp ba màn hình thực tế không lộ secret. |
 | Part 6 — Final Project | Nhờ ChatGPT kiểm tra yêu cầu Part 6, tạo bản vá cho cấu hình/health, Redis API security và Docker/deploy; hướng dẫn xử lý log | AI hỗ trợ code cho `app/config.py`, `app/main.py`, `app/redis_client.py`, `app/auth.py`, `app/rate_limiter.py`, `app/cost_guard.py`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml` và diễn giải output script chấm | Tự áp dụng code, tự chạy Redis và Uvicorn, xác nhận 200/503; chạy `--static-only`, `--skip-docker`, và script đầy đủ trên WSL2, đo **PASS 12/12 / 41/41**; tự chạy Compose và thử `/health`, `/ready`, `/ask`. Không sửa script chấm, không chép secret vào báo cáo. |
 
-> Các mục Part 3, Part 7 và AI log tương ứng sẽ được bổ sung sau khi hoàn thành các checkpoint tiếp theo.
+> Part 3 / CP6 đã hoàn tất. Kết quả benchmark và observability của Part 7 sẽ được bổ sung sau khi chạy các bài kiểm thử thực tế.
