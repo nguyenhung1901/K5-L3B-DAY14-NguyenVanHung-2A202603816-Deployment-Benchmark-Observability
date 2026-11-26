@@ -684,6 +684,93 @@ Sau đó `docker compose -p k5-day14-scaling down` đã gỡ ba Agent, Nginx, Re
 
 Đã chạy thành công health/readiness check, gửi SIGTERM và quan sát hai request hoàn thành trước khi tắt, khởi động 3 Agent qua Nginx cùng Redis, và xác minh 5 lượt hội thoại tạo đủ 10 messages trong một session được xử lý xuyên ba instance. Những điểm chưa kiểm chứng gồm: trạng thái `healthy` cuối của cả ba Agent, khả năng failover sau khi cố ý dừng một instance, và khả năng giữ session khi Redis bị xóa/khởi động lại. Các kết quả ghi trong Part 5 đều dựa trên log chạy thật, không phải số liệu minh họa trong README.
 
+
+---
+
+## Part 6: Final Project — Production-ready AI Agent
+
+**Thực hiện tại:** `06-lab-complete/` trong repository, trên Ubuntu WSL2 (`day14`), ngày 26/11/2026. Ứng dụng dùng mock LLM, không sử dụng OpenAI API key thật. Không chỉnh sửa `check_production_ready.py`.
+
+### 6.1. Hoàn thiện các thành phần của Agent
+
+Tôi hoàn thiện bản khung Part 6 qua ba bước và dùng script chấm để kiểm tra sau từng bước:
+
+1. **Cấu hình, health/readiness, logging:** đọc `AGENT_API_KEY`, `REDIS_URL`, `RATE_LIMIT_PER_MINUTE`, ngân sách, `PORT`, `ENVIRONMENT` từ biến môi trường; bổ sung `/health`, `/ready`, Redis client, log ứng dụng dạng JSON và xử lý lifecycle.
+2. **API Security:** xác thực `X-API-Key` (thiếu/sai trả 401); rate limiting lưu trạng thái trên Redis (vượt trả 429); cost guard từ chối khi hết ngân sách (402). Kết nối ba cơ chế vào `POST /ask`.
+3. **Đóng gói và triển khai:** Dockerfile multi-stage `python:3.11-slim`, user non-root, `HEALTHCHECK`, cổng từ `PORT`; Docker Compose có Agent + Redis; `.dockerignore` loại trừ secret và cache; bổ sung `railway.toml`.
+
+**Kiểm tra Redis và readiness:** trước khi áp dụng các cơ chế bảo vệ, chạy Redis container riêng với `redis:7-alpine`; `redis-cli ping` trả `PONG`. Khi Redis chưa hoạt động, `/health` trả `200`, `/ready` trả `503` với `Redis unavailable`; khi Redis hoạt động, `/ready` chuyển sang `200` với `{"ready":true}`.
+
+### 6.2. Kết quả script chấm đầy đủ
+
+Chạy tại `06-lab-complete/`:
+
+```bash
+python check_production_ready.py --redis-url redis://127.0.0.1:6379/0
+```
+
+**Kết quả thực tế (không dùng `--static-only` hoặc `--skip-docker`):**
+
+```text
+📋 Checklist Deliverable
+   ✅ Dockerfile (multi-stage, < 500 MB)
+   ✅ docker-compose.yml (agent + redis)
+   ✅ .dockerignore
+   ✅ Health check endpoint (GET /health)
+   ✅ Readiness endpoint (GET /ready)
+   ✅ API Key authentication
+   ✅ Rate limiting
+   ✅ Cost guard
+   ✅ Config từ environment variables
+   ✅ Structured logging
+   ✅ Graceful shutdown
+   ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+Result: 12/12 tiêu chí đạt · 41/41 checks passed
+🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+```
+
+Một số bằng chứng chi tiết từ output:
+
+| Kiểm tra | Kết quả quan sát |
+|---|---|
+| Docker image | Build thành công trong 42 giây; kích thước 56 MB, nhỏ hơn 500 MB |
+| Docker container | Chạy được; `GET /health` trả HTTP 200 |
+| Readiness | Có Redis → 200; mất Redis → 503 trong khi `/health` vẫn 200 |
+| API key | Thiếu/sai → 401; đúng → 200 |
+| Redis rate limit | Với `RATE_LIMIT_PER_MINUTE=5`, sau 5 request thành công thì trả 429; trạng thái còn sau restart Agent |
+| Cost guard | Khi ngân sách kiểm thử gần 0, request đầu tiên trả HTTP 402 |
+| Structured logging | Script xác nhận 12 dòng log ứng dụng là JSON hợp lệ |
+| Graceful shutdown | Request đang xử lý vẫn trả 200 sau SIGTERM; process thoát mã 0 |
+| Docker stop | Exit code 0, hoàn tất trong 1,1 giây (dưới 10 giây) |
+| Deployment config | `railway.toml` có builder và đường dẫn health check; ứng dụng sử dụng biến `PORT` |
+
+**Phạm vi kết luận:** mục số 12 kiểm tra sự sẵn sàng về **cấu hình deploy**; nó chưa chứng minh đã có URL public chạy trên Railway hoặc Render. Điều này sẽ được thực hiện ở CP6 / Part 3.
+
+### 6.3. Kiểm tra Docker Compose
+
+Đã chạy `docker compose -p k5-day14-final up -d --build` trong `06-lab-complete/`. Compose khởi động Agent và Redis; Redis có trạng thái `healthy`. Agent ở trạng thái `health: starting` lúc gọi `docker compose ps`, nhưng các API kiểm tra đều hoạt động:
+
+```text
+GET /health  -> HTTP/1.1 200 OK
+{"status":"ok","uptime_seconds":3.45,"environment":"development"}
+
+GET /ready   -> HTTP/1.1 200 OK
+{"ready":true}
+
+POST /ask (gửi X-API-Key hợp lệ, JSON {"question":"Hello Part 6"})
+-> HTTP/1.1 200 OK
+{"question":"Hello Part 6","answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic.","usage":{"input_tokens":3,"output_tokens":24,"cost_usd":1.485e-05}}
+```
+
+Đã dừng stack bằng `docker compose -p k5-day14-final down`. Không đưa API key vào báo cáo.
+
+**Lưu ý khi chạy WSL trên `/mnt/d`:** lệnh `sed -i` để thay key trong `.env` có cảnh báo `preserving permissions ... Operation not permitted`, nhưng sau đó API `/ask` qua Compose vẫn trả 200 với key đọc từ `.env`. Cảnh báo này không làm bài chấm 12/12 thất bại; vẫn cần kiểm tra `.env` không bị commit và key triển khai cloud phải được đặt riêng qua secret/environment trên nền tảng.
+
+### Tổng kết Part 6
+
+Agent Part 6 đạt **PASS 12/12, 41/41 checks passed** trên môi trường local có Docker và Redis. Các kiểm thử chính về xác thực, giới hạn tần suất, ngân sách, readiness, logging và shutdown đã chạy thành công. Bước còn lại của nhóm Deployment là tạo URL public và minh chứng trên Railway/Render trong CP6.
+
 ---
 
 ## AI log
@@ -694,5 +781,6 @@ Sau đó `docker compose -p k5-day14-scaling down` đã gỡ ba Agent, Nginx, Re
 | Part 2 — Exercise 2.1–2.4 | Nhờ ChatGPT giải thích Dockerfile, multi-stage build, lỗi Docker Hub 429, lỗi cú pháp JSON trong PowerShell và hỗ trợ viết báo cáo | Hướng dẫn lệnh build/run, so sánh kích thước, đọc Docker Compose, diễn giải kiến trúc và tổng hợp số liệu | Tự build hai image, chạy và kiểm thử container; dùng `docker image inspect` tính mức giảm 86,53%; tự đăng nhập Docker Hub, pull image, chạy bốn service và kiểm tra API qua Nginx. Đối chiếu log đầu ra trước khi đưa số liệu vào báo cáo. |
 | Part 4 — Exercise 4.1–4.4 | Nhờ ChatGPT hướng dẫn kiểm thử API key/JWT, rate limiting, đề xuất thiết kế cost guard | Giải thích 401/403/200/429, thống kê usage, phân biệt ngân sách mẫu in-memory với bài toán Redis $10/tháng, phát hiện trường phản hồi `/ask` đặt sai tên | Tự chạy các curl, vòng lặp 20 request và kiểm tra response `curl -i` HTTP 429 trên WSL2; xem HTTP status, headers và `/me/usage`; đối chiếu `app.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`; chưa tuyên bố đã test HTTP 402 hoặc chạy Redis budget. |
 | Part 5 — Exercise 5.1–5.5 | Nhờ ChatGPT hướng dẫn kiểm thử health/readiness, graceful shutdown và thiết kế stateless/load balancing | Hỗ trợ đối chiếu checkpoint, giải thích Redis session, Nginx và tổng hợp báo cáo Part 5 | Tự gọi `/health`, `/ready`, `/ask`; gửi SIGTERM đến PID 8966, ghi nhận hai HTTP 200 và log shutdown; tự chạy Docker Compose với 3 Agent, `test_stateless.py`, kiểm tra khóa session trong Redis và dừng stack; chỉ ghi những kết quả đã quan sát. |
+| Part 6 — Final Project | Nhờ ChatGPT kiểm tra yêu cầu Part 6, tạo bản vá cho cấu hình/health, Redis API security và Docker/deploy; hướng dẫn xử lý log | AI hỗ trợ code cho `app/config.py`, `app/main.py`, `app/redis_client.py`, `app/auth.py`, `app/rate_limiter.py`, `app/cost_guard.py`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml` và diễn giải output script chấm | Tự áp dụng code, tự chạy Redis và Uvicorn, xác nhận 200/503; chạy `--static-only`, `--skip-docker`, và script đầy đủ trên WSL2, đo **PASS 12/12 / 41/41**; tự chạy Compose và thử `/health`, `/ready`, `/ask`. Không sửa script chấm, không chép secret vào báo cáo. |
 
-> Các mục Part 3, kết quả Part 6 và Part 7 cùng AI log tương ứng sẽ được bổ sung sau khi hoàn thành từng checkpoint.
+> Các mục Part 3, Part 7 và AI log tương ứng sẽ được bổ sung sau khi hoàn thành các checkpoint tiếp theo.
