@@ -62,9 +62,9 @@ Mỗi cấu hình chạy **300 request, concurrency 20**; lần lượt đặt `
 | Cost / câu đúng (USD) | 0.00040875 | 0.00003607 | 0.00003589 |
 | Quality gate | FAIL (80%) | PASS (80%, 0 regression) | **PASS (100%, 0 regression)** |
 
-**Những câu v2 trả lời sai ban đầu và cách bạn sửa:**
+**Hai câu Agent v2 chưa đạt ban đầu và cách khắc phục:**
 
-| ID | Keyword bị thiếu | Bạn đã sửa gì |
+| ID | Keyword bị thiếu | Nội dung điều chỉnh Knowledge Base |
 |---|---|---|
 | `security-02` | `token`, `hết hạn`, `chữ ký` | Bổ sung entry `jwt`/`json web token` vào `develop/utils/mock_llm.py`, giải thích JWT là token có chữ ký số và thời điểm hết hạn, đối chiếu với API key. |
 | `scaling-03` | `cpu`, `memory`, `custom metrics` | Bổ sung entry `kubernetes hpa`/`hpa`/`horizontal pod autoscaler`, giải thích HPA scale replica dựa trên CPU, memory và custom metrics. |
@@ -75,7 +75,9 @@ Agent v1 (không retrieval) có p95 eval thấp hơn (191.6 ms), ít token hơn 
 
 So với v1, phiên bản v2 cuối tiêu thụ nhiều token và có tổng chi phí mô phỏng cao hơn (0.000825 so với 0.000409 USD), nhưng **cost/câu đúng** thấp hơn (0.00003589 so với 0.00040875 USD). Đây là trade-off hợp lý trong benchmark này: tăng retrieval context làm tăng latency/cost theo request nhưng cải thiện chất lượng đủ lớn để giảm chi phí trên mỗi câu đúng. Giá token là **mô phỏng** trong `mock_llm.py`, không phải chi phí API LLM thực tế.
 
-Eval sử dụng **23 câu golden dataset**, `MOCK_ERROR_RATE=0`, `MOCK_SLOW_RATE=0`; hai lần đo v1/v2 sử dụng ngưỡng mặc định 80%, còn lần kiểm tra v2 sau sửa dùng `--min-accuracy 1.0` và baseline `eval_v2.json`. CI Exercise 7.3 yêu cầu ngưỡng riêng 85%; job CI được cung cấp trong `.github/workflows/eval.yml`.
+Eval sử dụng **23 câu golden dataset**, `MOCK_ERROR_RATE=0`, `MOCK_SLOW_RATE=0`; hai lần đo v1/v2 sử dụng ngưỡng mặc định 80%, còn lần kiểm tra v2 sau sửa dùng `--min-accuracy 1.0` và baseline `eval_v2.json`. CI của Exercise 7.3 dùng ngưỡng riêng 85%, được cấu hình tại `.github/workflows/eval.yml`. Khi accuracy dưới ngưỡng, `run_eval.py` trả exit code khác 0, làm job thất bại. Để **thực sự chặn merge**, repository còn cần bật branch protection/ruleset yêu cầu check `eval` thành công.
+
+**Xác minh GitHub Actions:** Workflow **`quality-gate #1`** được kích hoạt thủ công (`workflow_dispatch`) trên nhánh `main`, commit `163a2c2`, kết thúc với trạng thái **Success** sau **26 giây**; job **`eval`** có dấu tích xanh (19 giây). Như vậy CI đã chạy thành công với cấu hình ngưỡng **85%**. Ảnh Summary **không hiển thị điểm accuracy chi tiết của lượt CI**; kết quả **23/23 (100%)** trong bảng trên là từ lần Eval local sau khi sửa Knowledge Base. GitHub ghi nhận một cảnh báo tương thích về Node.js 20 đối với `actions/checkout@v4` và `actions/setup-python@v5` (runner dùng Node.js 24); cảnh báo này không khiến workflow thất bại. Chạy CI chưa có artifact được xuất ra (`Artifacts: —`). Minh chứng: [ảnh GitHub Actions](screenshots/github-actions-quality-gate.png).
 
 ---
 
@@ -86,11 +88,19 @@ Eval sử dụng **23 câu golden dataset**, `MOCK_ERROR_RATE=0`, `MOCK_SLOW_RAT
 - [x] Dashboard Grafana khi đang có tải (thấy rõ Golden Signals)
 - [x] Một trace chậm trong Jaeger (thấy span nào chiếm thời gian)
 - [x] Một trace lỗi trong Jaeger (có event `exception`)
-- [x] Trang Alerts của Prometheus với ít nhất 1 alert đang **firing**
+- [x] Trang Alerts của Prometheus với ít nhất 2 alert cùng ở trạng thái **firing**
 
-Đã có ảnh trang **Prometheus `/alerts`**, hiển thị đồng thời `AgentHighErrorRate` (critical) và `AgentHighLatencyP95` (warning) ở trạng thái **FIRING**, đúng yêu cầu minh chứng. Tại thời điểm chụp, giá trị biểu thức cảnh báo lần lượt khoảng **0,2179** (21,79% lỗi) và **1,896 giây** (p95). Ảnh được lưu với tên `screenshots/prometheus-alert-firing.png`. Các ảnh Grafana và Jaeger cần được đặt đúng tên trong `screenshots/` của repository.
+Đã có ảnh trang **Prometheus `/alerts`**, hiển thị đồng thời `AgentHighErrorRate` (critical) và `AgentHighLatencyP95` (warning) ở trạng thái **FIRING**, đúng yêu cầu minh chứng. Tại thời điểm chụp, giá trị biểu thức cảnh báo lần lượt khoảng **0,2179** (21,79% lỗi) và **1,896 giây** (p95). Ảnh được lưu với tên `screenshots/prometheus-alert-firing.png`. Các ảnh Grafana và Jaeger đã được lưu theo đúng tên trong thư mục `screenshots/`.
 
 Dashboard Grafana trong lúc có tải ghi nhận khoảng **17,8 req/s**, **error rate 1,02%**, **p95 433 ms** và **1 instance** tại thời điểm chụp. Ngoài Golden Signals còn có biểu đồ token, chi phí mô phỏng, độ trễ LLM và retrieval hit ratio. Đây là số liệu ở một thời điểm, không thay thế phép đo Locust headless.
+
+**Trả lời bốn câu hỏi Exercise 7.4 (theo số liệu đã lưu):**
+
+1. **p95 và avg:** Ảnh Grafana ghi p95 `/ask` khoảng **433 ms** nhưng không hiển thị được giá trị avg cùng thời điểm, vì vậy **không thể xác định khoảng cách chính xác trên cùng cửa sổ Grafana**. Để minh họa từ **phép đo Locust riêng** (1 Agent, 100 users, hai phút), avg toàn bộ request là **262,70 ms**, p95 là **710 ms**: p95 lớn hơn avg **447,30 ms**, cho thấy một nhóm request chậm đáng kể hơn mức trung bình. Không lấy các số Locust này gán cho thời điểm ảnh Grafana.
+2. **Phân phối traffic theo instance:** Ảnh Grafana ghi **1 instance**, nên **chưa có đủ dữ liệu để kết luận Nginx phân phối đều giữa 2 instance** như câu hỏi ví dụ. Bài scaling sau đó có đủ 3 instance `healthy`, nhưng để kiểm chứng tính đều cần so sánh series `Requests/s theo instance` trong cùng khoảng thời gian khi cả hai/ba instance cùng phục vụ tải.
+3. **Input tokens/s và output tokens/s:** Ở ảnh panel `Tokens/s` đã quan sát, đường **output** (vàng) nằm cao hơn đường **input** (xanh) ở cuối khoảng tải; vì vậy giả định trong câu hỏi rằng input luôn lớn hơn output **không đúng với ảnh này**. Về nguyên tắc, đầu vào có thể lớn khi prompt chứa câu hỏi, system prompt và retrieval context, nhưng tỷ lệ còn phụ thuộc lượng token mô phỏng cho mỗi request và tốc độ request trong cửa sổ đo. Không có số đọc chính xác cho từng đường tại cùng một thời điểm nên không kết luận tỷ lệ định lượng.
+4. **Truy cập `/metrics`:** `curl http://localhost:8080/metrics` qua Nginx trả **HTTP 404** theo cấu hình chặn truy cập công khai. Prometheus vẫn scrape endpoint `/metrics` của Agent qua Docker network nội bộ, được xác nhận bằng Target `agent` ở trạng thái UP.
+
 
 ### 4.2 Thí nghiệm "phá hệ thống"
 
@@ -106,24 +116,32 @@ Bằng chứng thực tế: lần cấu hình A với `MOCK_ERROR_RATE=0.2` và 
 
 Đã hoàn thành **hai thí nghiệm bắt buộc A và B**. Không suy diễn kết quả C–E. Ngưỡng `for` của rule (1 phút đối với Error Rate, 2 phút đối với Latency p95) **không được coi là số đo thời gian thực tế đến khi FIRING**.
 
-**Thí nghiệm E không làm alert nào firing. Bạn sẽ phát hiện loại sự cố này trong production bằng cách nào?**
+**Tình huống E (giả định): Nếu chuyển `AGENT_VERSION=v1` mà không có alert nào FIRING, làm thế nào phát hiện suy giảm chất lượng?**
 
 Cần giám sát **chất lượng đầu ra**, không chỉ uptime, latency và HTTP error rate: chạy evaluation định kỳ trên golden dataset, theo dõi accuracy theo `agent_version`, tỷ lệ retrieval hit và các câu bị regression; cảnh báo nếu accuracy giảm dưới ngưỡng hoặc tăng số câu trả lời không đạt. Việc chuyển `AGENT_VERSION=v1` có thể vẫn trả HTTP 200 nên các alert vận hành hiện tại chưa đủ phát hiện suy giảm chất lượng.
 
 ### 4.3 Debug bằng trace
 
-Chọn 1 trace chậm nhất bạn tìm được:
+**Trace chậm được chọn để phân tích:**
 
 - `trace_id`: **`34714fef356c26104f9e56897ec76baa`**, trích từ URL Jaeger của slow trace: `http://localhost:16686/trace/34714fef356c26104f9e56897ec76baa`.
 - Tổng thời gian: **khoảng 2.300 ms** (Jaeger hiển thị 2,3 s).
-- Span chiếm nhiều thời gian nhất: **`chat mock-llm-small` (khoảng 1.700 ms, tương đương ~74% tổng thời gian)**. Span `agent.run` kéo dài khoảng 1.800 ms; `agent.retrieve_context` khoảng 115 ms. Các span lồng nhau nên không cộng thời gian của chúng trực tiếp.
+- **Span cha dài nhất trong luồng thực thi Agent** là `agent.run` (khoảng 1.800 ms). Trong các **span con**, `chat mock-llm-small` chiếm nhiều thời gian nhất (khoảng 1.700 ms, tương đương ~94% thời gian `agent.run` và ~74% tổng thời gian HTTP); `agent.retrieve_context` khoảng 115 ms. Các span lồng nhau nên không cộng thời gian của chúng trực tiếp. Đây là bottleneck của trace được chọn, không đủ cơ sở khẳng định bottleneck của mọi request.
 - Dòng log tương ứng (grep theo `trace_id`): **Không truy xuất được từ các container Agent hiện tại**. Trace này được ghi trước khi Agent bị recreate nhiều lần; kết quả `docker compose logs --no-log-prefix agent | Select-String -SimpleMatch "34714fef356c26104f9e56897ec76baa"` không có dòng khớp. Jaeger vẫn lưu dấu vết và ảnh chứng minh được phân rã độ trễ, nhưng không có cơ sở để trích dẫn một JSON log cùng trace_id.
 
 ```text
 Không có dòng JSON log gốc để trích dẫn cho slow trace này.
 ```
 
-Một trace lỗi riêng biệt đã xác nhận `POST /ask` trả HTTP 503, span `chat mock-llm-small` có `error.type=upstream_unavailable` và exception `Upstream LLM error: 503 Service Unavailable (mock)`. Ví dụ `trace_id` của trace lỗi đã đối chiếu với JSON log: `675717865b8a1c6cad2a1b1184375d80`. Không dùng trace ID lỗi thay cho trace ID chậm ở ô trên.
+Một trace lỗi riêng biệt đã xác nhận `POST /ask` trả HTTP 503, span `chat mock-llm-small` có `error.type=upstream_unavailable` và exception `Upstream LLM error: 503 Service Unavailable (mock)`. `trace_id` của trace lỗi đã đối chiếu với JSON log: `675717865b8a1c6cad2a1b1184375d80`. Không dùng trace ID lỗi thay cho trace ID chậm ở ô trên.
+
+**Bằng chứng JSON log ↔ Jaeger error trace (đã ghi từ terminal trước khi recreate container):**
+
+```json
+{"ts":"2026-11-26T13:54:03.003011+00:00","level":"INFO","service":"observable-agent","instance":"748ec4964074","event":"llm_error","trace_id":"675717865b8a1c6cad2a1b1184375d80","span_id":"3d786dd7899e8888","request_id":"64c584054616","error":"Upstream LLM error: 503 Service Unavailable (mock)"}
+```
+
+Dòng JSON trên là **log của trace lỗi**, không phải log của slow trace, trường hợp slow trace vẫn thiếu log đối chiếu.
 
 ---
 
@@ -146,12 +164,12 @@ Kết quả gợi ý rằng tăng replica giúp giảm thời gian chờ ở nh�
 
 ## 6. Kết luận
 
-- 3 điều bạn học được về benchmark & observability:
+- **Ba bài học rút ra từ benchmark và observability:**
   1. **Phải đo nhiều chiều:** throughput tăng không bảo đảm latency tốt; p95 và p99 giúp phát hiện nhóm request chậm mà average có thể che khuất. SLO latency và SLO error rate cần kiểm tra độc lập.
   2. **Monitoring và tracing bổ trợ nhau:** Prometheus/Grafana cho thấy dấu hiệu bất thường ở toàn hệ thống, còn Jaeger cùng `trace_id` trong JSON logs giúp tìm span gây chậm hoặc phát sinh exception.
   3. **Scaling phải được kiểm soát và xác minh:** tăng từ 1 lên 3 Agent cải thiện p95 nhưng không tăng tuyến tính RPS; cần xác nhận số replica trước/sau phép đo và giữ nguyên cấu hình tải để tránh so sánh sai.
-- Nếu đưa agent này lên production thật, bạn sẽ thêm metric / alert nào nữa?
+- **Các metrics/alerts cần bổ sung trước khi vận hành production thực tế:**
 
 Bổ sung metrics và alerts cho **accuracy/quality regression theo phiên bản**, tỷ lệ câu trả lời không có căn cứ, retrieval hit rate thấp, **p99 latency**, timeout của upstream LLM, retry, saturation (CPU/RAM và số request đang xử lý), chi phí token theo giờ/ngày và tỷ lệ vượt ngân sách. Kết hợp kiểm thử golden dataset trong CI với kiểm tra định kỳ dữ liệu production đã ẩn danh để phát hiện suy giảm chất lượng mà HTTP 200 không phản ánh.
 
-**Tình trạng minh chứng cuối:** Đã có ảnh `/alerts` thể hiện hai cảnh báo cùng FIRING và `trace_id` đầy đủ của slow trace. **Giới hạn dữ liệu:** Không còn JSON log gốc của slow trace do Agent đã được recreate; không ghi nhận chính xác khoảng thời gian từ lúc đổi cấu hình tới lúc từng alert FIRING. Trường `Active Since` trên ảnh `/alerts` thể hiện thời gian alert đã hoạt động tại thời điểm chụp, **không phải** thời gian từ khi thay đổi cấu hình đến khi FIRING. Các dữ liệu chưa quan sát được không bị thay bằng con số ước lượng.
+**Tình trạng minh chứng cuối:** Đã có ảnh `/alerts` thể hiện hai cảnh báo cùng FIRING, `trace_id` đầy đủ của slow trace và GitHub Actions `quality-gate #1` chạy thành công trên `main`. **Giới hạn dữ liệu:** Không còn JSON log gốc của slow trace do Agent đã được recreate; không ghi nhận chính xác khoảng thời gian từ lúc đổi cấu hình tới lúc từng alert FIRING. Trường `Active Since` trên ảnh `/alerts` thể hiện thời gian alert đã hoạt động tại thời điểm chụp, **không phải** thời gian từ khi thay đổi cấu hình đến khi FIRING. Các dữ liệu chưa quan sát được không bị thay bằng con số ước lượng.
