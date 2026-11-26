@@ -83,37 +83,47 @@ Eval sử dụng **23 câu golden dataset**, `MOCK_ERROR_RATE=0`, `MOCK_SLOW_RAT
 
 ### 4.1 Screenshot
 
-- [ ] Dashboard Grafana khi đang có tải (thấy rõ Golden Signals)
-- [ ] Một trace chậm trong Jaeger (thấy span nào chiếm thời gian)
-- [ ] Một trace lỗi trong Jaeger (có event `exception`)
-- [ ] Trang Alerts của Prometheus với ít nhất 1 alert đang **firing**
+- [x] Dashboard Grafana khi đang có tải (thấy rõ Golden Signals)
+- [x] Một trace chậm trong Jaeger (thấy span nào chiếm thời gian)
+- [x] Một trace lỗi trong Jaeger (có event `exception`)
+- [x] Trang Alerts của Prometheus với ít nhất 1 alert đang **firing**
+
+Đã có ảnh trang **Prometheus `/alerts`**, hiển thị đồng thời `AgentHighErrorRate` (critical) và `AgentHighLatencyP95` (warning) ở trạng thái **FIRING**, đúng yêu cầu minh chứng. Tại thời điểm chụp, giá trị biểu thức cảnh báo lần lượt khoảng **0,2179** (21,79% lỗi) và **1,896 giây** (p95). Ảnh được lưu với tên `screenshots/prometheus-alert-firing.png`. Các ảnh Grafana và Jaeger cần được đặt đúng tên trong `screenshots/` của repository.
+
+Dashboard Grafana trong lúc có tải ghi nhận khoảng **17,8 req/s**, **error rate 1,02%**, **p95 433 ms** và **1 instance** tại thời điểm chụp. Ngoài Golden Signals còn có biểu đồ token, chi phí mô phỏng, độ trễ LLM và retrieval hit ratio. Đây là số liệu ở một thời điểm, không thay thế phép đo Locust headless.
 
 ### 4.2 Thí nghiệm "phá hệ thống"
 
 | # | Thay đổi | Alert nào firing | Thời gian từ lúc đổi → firing | Panel nào phản ánh rõ nhất |
 |---|---|---|---|---|
-| A | `MOCK_ERROR_RATE=0.2` | | | |
-| B | `MOCK_SLOW_RATE=0.3` | | | |
-| C | `LLM_MODEL=mock-llm-large` | | | |
-| D | `docker pause` 1 instance | | | |
-| E | `AGENT_VERSION=v1` | | | |
+| A | `MOCK_ERROR_RATE=0.2` | `AgentHighErrorRate` (critical) | Đã FIRING; **chưa ghi chính xác thời điểm bắt đầu / firing** | Golden Signals — Error rate; Locust Failures |
+| B | `MOCK_SLOW_RATE=0.3` | `AgentHighLatencyP95` (warning) | Đã đi qua PENDING → FIRING; **chưa ghi chính xác thời gian** | Golden Signals — Latency p95; Locust 95%ile |
+| C | `LLM_MODEL=mock-llm-large` | Chưa thực hiện | Không có số liệu | Chưa đánh giá |
+| D | `docker pause` 1 instance | Chưa thực hiện | Không có số liệu | Chưa đánh giá |
+| E | `AGENT_VERSION=v1` | Chưa thực hiện (tình huống lý thuyết trong đề) | Không có số liệu | Chưa đánh giá |
+
+Bằng chứng thực tế: lần cấu hình A với `MOCK_ERROR_RATE=0.2` và 30 Locust users ghi nhận khoảng **19% failures** và Prometheus có `AgentHighErrorRate{alertstate="firing"}`. Với B, `MOCK_SLOW_RATE=0.3`, Locust ghi nhận **p95 ≈ 1.700 ms** và Prometheus có `AgentHighLatencyP95{alertstate="firing"}`. Khi đặt đồng thời `MOCK_ERROR_RATE=0.2` và `MOCK_SLOW_RATE=0.3`, truy vấn `ALERTS{alertstate="firing"}` hiển thị **cả hai cảnh báo**. `promtool test rules /p/alert_rules_test.yml` cũng trả `SUCCESS`.
+
+Đã hoàn thành **hai thí nghiệm bắt buộc A và B**. Không suy diễn kết quả C–E. Ngưỡng `for` của rule (1 phút đối với Error Rate, 2 phút đối với Latency p95) **không được coi là số đo thời gian thực tế đến khi FIRING**.
 
 **Thí nghiệm E không làm alert nào firing. Bạn sẽ phát hiện loại sự cố này trong production bằng cách nào?**
 
-...
+Cần giám sát **chất lượng đầu ra**, không chỉ uptime, latency và HTTP error rate: chạy evaluation định kỳ trên golden dataset, theo dõi accuracy theo `agent_version`, tỷ lệ retrieval hit và các câu bị regression; cảnh báo nếu accuracy giảm dưới ngưỡng hoặc tăng số câu trả lời không đạt. Việc chuyển `AGENT_VERSION=v1` có thể vẫn trả HTTP 200 nên các alert vận hành hiện tại chưa đủ phát hiện suy giảm chất lượng.
 
 ### 4.3 Debug bằng trace
 
 Chọn 1 trace chậm nhất bạn tìm được:
 
-- `trace_id`: ...
-- Tổng thời gian: ... ms
-- Span chiếm nhiều thời gian nhất: ... (... ms, ...%)
-- Dòng log tương ứng (grep theo `trace_id`):
+- `trace_id`: **`34714fef356c26104f9e56897ec76baa`**, trích từ URL Jaeger của slow trace: `http://localhost:16686/trace/34714fef356c26104f9e56897ec76baa`.
+- Tổng thời gian: **khoảng 2.300 ms** (Jaeger hiển thị 2,3 s).
+- Span chiếm nhiều thời gian nhất: **`chat mock-llm-small` (khoảng 1.700 ms, tương đương ~74% tổng thời gian)**. Span `agent.run` kéo dài khoảng 1.800 ms; `agent.retrieve_context` khoảng 115 ms. Các span lồng nhau nên không cộng thời gian của chúng trực tiếp.
+- Dòng log tương ứng (grep theo `trace_id`): **Không truy xuất được từ các container Agent hiện tại**. Trace này được ghi trước khi Agent bị recreate nhiều lần; kết quả `docker compose logs --no-log-prefix agent | Select-String -SimpleMatch "34714fef356c26104f9e56897ec76baa"` không có dòng khớp. Jaeger vẫn lưu dấu vết và ảnh chứng minh được phân rã độ trễ, nhưng không có cơ sở để trích dẫn một JSON log cùng trace_id.
 
-```json
-
+```text
+Không có dòng JSON log gốc để trích dẫn cho slow trace này.
 ```
+
+Một trace lỗi riêng biệt đã xác nhận `POST /ask` trả HTTP 503, span `chat mock-llm-small` có `error.type=upstream_unavailable` và exception `Upstream LLM error: 503 Service Unavailable (mock)`. Ví dụ `trace_id` của trace lỗi đã đối chiếu với JSON log: `675717865b8a1c6cad2a1b1184375d80`. Không dùng trace ID lỗi thay cho trace ID chậm ở ô trên.
 
 ---
 
@@ -121,21 +131,27 @@ Chọn 1 trace chậm nhất bạn tìm được:
 
 | Số instance | RPS | p50 (ms) | p95 (ms) | p99 (ms) | Failures |
 |---|---|---|---|---|---|
-| 1 | | | | | |
-| 3 | | | | | |
+| 1 | 63.65 | 200 | 710 | 1700 | 88 / 7588 (1.16%) |
+| 3 | 65.10 | 190 | 290 | 1700 | 78 / 7689 (1.01%) |
 
 **Giải thích kết quả:** Scale có cải thiện p95 không? Nút thắt nằm ở đâu?
 
-...
+**Có.** Khi tăng từ 1 lên 3 Agent, p95 giảm từ 710 xuống 290 ms (**giảm 59,15%**), p50 giảm từ 200 xuống 190 ms và độ trễ trung bình giảm từ **262,70 xuống 228,14 ms** (khoảng **13,16%**). Tuy nhiên throughput chỉ tăng từ **63,65 lên 65,10 req/s** (**+2,27%**); p99 vẫn khoảng **1.700 ms** và error rate giảm nhẹ từ khoảng 1,16% xuống 1,01%.
+
+Kết quả gợi ý rằng tăng replica giúp giảm thời gian chờ ở nhóm request gần p95, trong khi nhóm request rất chậm vẫn chủ yếu chịu độ trễ Mock LLM. **Chưa thể kết luận nút thắt duy nhất**, cũng không thể khẳng định hệ thống scale tuyến tính; mức phát tải hữu hạn của Locust (100 users, có wait time), tài nguyên host, Nginx hoặc LLM đều có thể giới hạn RPS. Cần đo lặp lại và kiểm tra CPU/RAM, queueing, tỷ lệ request theo instance nếu muốn kết luận định lượng.
+
+**Điều kiện đo:** hai lần Locust headless có cùng `-u 100 -r 10 -t 2m`, host `http://nginx`, cấu hình mock bình thường `MOCK_ERROR_RATE=0.01`, `MOCK_SLOW_RATE=0.03`. Đã dùng `docker compose run --rm --no-deps locust` để giữ số replica; sau lần đo 1 Agent chỉ còn `agent-1` healthy, sau lần đo 3 Agent có đủ `agent-1/2/3` healthy. Các con số trên ưu tiên đọc từ `scale_1_stats.csv` và `scale_3_stats.csv`; p50 là số liệu percentile xấp xỉ trong log Locust. Số requests ở terminal và CSV có sai khác nhẹ tại thời điểm kết thúc.
 
 ---
 
 ## 6. Kết luận
 
 - 3 điều bạn học được về benchmark & observability:
-  1. ...
-  2. ...
-  3. ...
+  1. **Phải đo nhiều chiều:** throughput tăng không bảo đảm latency tốt; p95 và p99 giúp phát hiện nhóm request chậm mà average có thể che khuất. SLO latency và SLO error rate cần kiểm tra độc lập.
+  2. **Monitoring và tracing bổ trợ nhau:** Prometheus/Grafana cho thấy dấu hiệu bất thường ở toàn hệ thống, còn Jaeger cùng `trace_id` trong JSON logs giúp tìm span gây chậm hoặc phát sinh exception.
+  3. **Scaling phải được kiểm soát và xác minh:** tăng từ 1 lên 3 Agent cải thiện p95 nhưng không tăng tuyến tính RPS; cần xác nhận số replica trước/sau phép đo và giữ nguyên cấu hình tải để tránh so sánh sai.
 - Nếu đưa agent này lên production thật, bạn sẽ thêm metric / alert nào nữa?
 
-...
+Bổ sung metrics và alerts cho **accuracy/quality regression theo phiên bản**, tỷ lệ câu trả lời không có căn cứ, retrieval hit rate thấp, **p99 latency**, timeout của upstream LLM, retry, saturation (CPU/RAM và số request đang xử lý), chi phí token theo giờ/ngày và tỷ lệ vượt ngân sách. Kết hợp kiểm thử golden dataset trong CI với kiểm tra định kỳ dữ liệu production đã ẩn danh để phát hiện suy giảm chất lượng mà HTTP 200 không phản ánh.
+
+**Tình trạng minh chứng cuối:** Đã có ảnh `/alerts` thể hiện hai cảnh báo cùng FIRING và `trace_id` đầy đủ của slow trace. **Giới hạn dữ liệu:** Không còn JSON log gốc của slow trace do Agent đã được recreate; không ghi nhận chính xác khoảng thời gian từ lúc đổi cấu hình tới lúc từng alert FIRING. Trường `Active Since` trên ảnh `/alerts` thể hiện thời gian alert đã hoạt động tại thời điểm chụp, **không phải** thời gian từ khi thay đổi cấu hình đến khi FIRING. Các dữ liệu chưa quan sát được không bị thay bằng con số ước lượng.
